@@ -1,0 +1,19 @@
+# Secrets & Local Identity
+identity.pem
+*.pem
+*.key
+
+# Virtual Environment & Python Cache
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+artifacts/
+
+# Dynamic State Files
+cursor.json
+work_ledger.jsonl
+*.tmp
+
+# Submodules / Starters
+technocore-did-starter/
