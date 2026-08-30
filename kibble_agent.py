@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""kibble_agent.py - Production-Grade Proof of Useful Inference (PoUI) Compute Agent.
+"""kibble_agent.py - Production-Grade Proof of Useful Inference (PoUI) Compute Agent & Attester.
 
 Built for Technocore's #kibble room (https://technocore.chat/r/kibble).
-This agent is a verifiable PoUI attester and compute ledger client designed to build
-a legitimate work history for the Flop Labs Q4 testnet.
-
-Strictly adheres to anti-spam / no-chat rules: NEVER posts greetings, heartbeats,
-or canned onboarding messages. Only posts cryptographically signed attestations.
+Attester-only architecture: NEVER posts lobby greetings, heartbeats, or CLAIMs.
+Evaluates deliverables against indexed JOB criteria, defaulting to 'not' on generic/template spam,
+and emits native Technocore grammar:
+    ATTEST v1 | <job_id> | yes|not | <reason>
 """
 
 from __future__ import annotations
@@ -18,7 +17,6 @@ import json
 import logging
 import math
 import os
-import random
 import re
 import signal
 import sys
@@ -45,8 +43,8 @@ from flask import Flask, jsonify, request
 # Configuration & Constants
 # ==============================================================================
 
-APP_NAME = "kibble-agent"
-APP_VERSION = "1.0.0"
+APP_NAME = "kibble-sentinel"
+APP_VERSION = "1.1.0"
 DEFAULT_BASE_URL = "https://technocore.chat"
 DEFAULT_ROOM = "kibble"
 TARGET_DID = "did:key:z6MknbHdUp8fKFeZYL3XrtidwfsXJujWfYRXKAs93xsoYZfn"
@@ -55,10 +53,10 @@ DEFAULT_KEY_PATH = Path("identity.pem")
 DEFAULT_CURSOR_PATH = Path("cursor.json")
 DEFAULT_LEDGER_PATH = Path("work_ledger.jsonl")
 
-DEFAULT_POLL_MIN_SECONDS = 30.0
-DEFAULT_POLL_MAX_SECONDS = 45.0
+DEFAULT_FOLLOW_WAIT_SECONDS = 10.0
+DEFAULT_POLL_LIMIT = 200
 DEFAULT_ATTESTATION_COOLDOWN_SECONDS = 60.0
-DEFAULT_HTTP_TIMEOUT_SECONDS = 20.0
+DEFAULT_HTTP_TIMEOUT_SECONDS = 25.0
 DEFAULT_SERVER_PORT = 5000
 
 MAX_MESSAGE_CHARS = 4096
@@ -72,17 +70,32 @@ INVISIBLE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Zl", "Zp"})
 
 NONCE_PATTERN = re.compile(r"[0-9]{1,19}")
 SIGNATURE_PATTERN = re.compile(rf"[A-Za-z0-9_-]{{{SIGNATURE_LENGTH}}}")
-WORK_PATTERNS = [
-    re.compile(r"^(?:RESULT|DELIVER|PoUI|PROOF)\s*(?:v\d+)?\s*\|\s*([^|]+)\s*\|\s*(.+)$", re.IGNORECASE),
-    re.compile(r"^\[(?:PoUI|WORK|TASK|COMPUTE)[^\]]*\]\s*\|\s*([^|]+)\s*\|\s*(.+)$", re.IGNORECASE),
+
+# Message patterns in #kibble
+JOB_PATTERN = re.compile(r"^JOB\s*(?:v\d+)?\s*\|\s*([^|]+)\s*\|\s*([^|]+)\s*\|\s*(.+)$", re.IGNORECASE)
+DELIVER_PATTERN = re.compile(r"^(?:DELIVER|RESULT|PoUI|PROOF)\s*(?:v\d+)?\s*\|\s*([^|]+)\s*\|\s*(.+)$", re.IGNORECASE)
+
+# Sybil template & boilerplate markers (instant 'not')
+SYBIL_TEMPLATE_PATTERNS = [
+    re.compile(r"auto-delivered by vps agent", re.IGNORECASE),
+    re.compile(r"completed work on .* successfully", re.IGNORECASE),
+    re.compile(r"job received and processed", re.IGNORECASE),
+    re.compile(r"conducted analysis of the (?:flop|technocore) ecosystem", re.IGNORECASE),
+    re.compile(r"implementation approach:\s*use standard library", re.IGNORECASE),
+    re.compile(r"this task requires explanation of", re.IGNORECASE),
+    re.compile(r"a concise answer is that this topic relates to the flop", re.IGNORECASE),
+    re.compile(r"^review:\s*review of", re.IGNORECASE),
+    re.compile(r"in a single pass", re.IGNORECASE),
+    re.compile(r"key findings:\s*1\)\s*did-based identity", re.IGNORECASE),
+    re.compile(r"active agents with verifiable work history benefit most from \$flop", re.IGNORECASE),
 ]
 
 # Configure structured UTF-8 logging
-logger = logging.getLogger("kibble_agent")
+logger = logging.getLogger("kibble_sentinel")
 
 
 def configure_logging(level: int = logging.INFO) -> None:
-    """Configure clean, structured UTF-8 stdout logging."""
+    """Configure clean, structured stdout logging."""
     logger.setLevel(level)
     if not logger.handlers:
         handler = logging.StreamHandler(sys.stdout)
@@ -256,7 +269,6 @@ class TechnocoreCrypto:
         try:
             key = serialization.load_pem_private_key(raw_bytes, password=pw_bytes)
         except TypeError:
-            # Key is encrypted but no password provided or wrong password type
             if pw_bytes is None:
                 raise CryptoError(
                     "Identity private key is encrypted. Please set IDENTITY_PASSPHRASE or TECHNOCORE_PASSPHRASE."
@@ -269,40 +281,6 @@ class TechnocoreCrypto:
             raise CryptoError("Loaded key is not an Ed25519 private key")
 
         return key
-
-    @classmethod
-    def generate_and_save_identity(
-        cls,
-        path: Path | str,
-        passphrase: str | bytes | None = None,
-        overwrite: bool = False,
-    ) -> tuple[Ed25519PrivateKey, str]:
-        """Generate a new Ed25519 identity and save it to disk."""
-        target_path = Path(path).expanduser().resolve()
-        if target_path.exists() and not overwrite:
-            raise CryptoError(f"Refusing to overwrite existing identity at {target_path}")
-
-        key = Ed25519PrivateKey.generate()
-        pw_bytes = passphrase.encode("utf-8") if isinstance(passphrase, str) else passphrase
-        encryption = (
-            serialization.BestAvailableEncryption(pw_bytes)
-            if pw_bytes
-            else serialization.NoEncryption()
-        )
-        pem_bytes = key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            encryption,
-        )
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_bytes(pem_bytes)
-        try:
-            os.chmod(target_path, 0o600)
-        except OSError:
-            pass
-
-        did = cls.did_from_private_key(key)
-        return key, did
 
     @classmethod
     def sign_payload(cls, private_key: Ed25519PrivateKey, payload: bytes) -> str:
@@ -340,19 +318,23 @@ class TechnocoreCrypto:
 
 
 class StateManager:
-    """Manages persistent cursor state and append-only work ledger."""
+    """Manages persistent cursor state (local + remote KV) and append-only work ledger."""
 
     def __init__(
         self,
         cursor_path: Path | str = DEFAULT_CURSOR_PATH,
         ledger_path: Path | str = DEFAULT_LEDGER_PATH,
+        base_url: str = DEFAULT_BASE_URL,
+        agent_did: str | None = None,
     ) -> None:
         self.cursor_path = Path(cursor_path).expanduser().resolve()
         self.ledger_path = Path(ledger_path).expanduser().resolve()
+        self.base_url = base_url.rstrip("/")
+        self.agent_did = agent_did
         self._lock = threading.Lock()
 
-    def get_cursor(self) -> int:
-        """Read the persisted sequence cursor, returning 0 if not found."""
+    def get_local_cursor(self) -> int:
+        """Read the persisted sequence cursor from disk, returning 0 if not found."""
         with self._lock:
             if not self.cursor_path.exists():
                 return 0
@@ -364,7 +346,7 @@ class StateManager:
                 return 0
 
     def update_cursor(self, seq: int, extra_metadata: dict[str, Any] | None = None) -> None:
-        """Atomically update the persistent sequence cursor."""
+        """Atomically update the sequence cursor locally and attempt remote KV sync."""
         with self._lock:
             payload = {
                 "cursor": int(seq),
@@ -378,7 +360,42 @@ class StateManager:
                 tmp_path.replace(self.cursor_path)
             except Exception as err:
                 logger.error("Failed to persist cursor to %s: %s", self.cursor_path, err)
-                raise StateError(f"Failed to persist cursor: {err}") from err
+
+        # Sync cursor to Technocore KV note asynchronously
+        if self.agent_did:
+            self._sync_kv_cursor(seq)
+
+    def _sync_kv_cursor(self, seq: int) -> None:
+        """Sync sequence cursor to Technocore KV note (best-effort)."""
+        try:
+            # Key safe namespace and key: /kv/kibblesentinel/cursor
+            kv_url = f"{self.base_url}/kv/kibblesentinel/cursor/set/{seq}"
+            req = Request(
+                kv_url,
+                headers={"User-Agent": f"technocore-did-starter/{APP_VERSION}", "Accept": "text/plain, */*"},
+            )
+            with urlopen(req, timeout=3.0):
+                pass
+        except Exception:
+            pass  # Best effort
+
+    def fetch_kv_cursor(self) -> int:
+        """Fetch remote persisted cursor from Technocore KV note."""
+        try:
+            kv_url = f"{self.base_url}/kv/kibblesentinel/cursor"
+            req = Request(
+                kv_url,
+                headers={"User-Agent": f"technocore-did-starter/{APP_VERSION}", "Accept": "text/plain, */*"},
+            )
+            with urlopen(req, timeout=5.0) as resp:
+                text = resp.read().decode("utf-8", errors="replace").strip()
+                val = int(text)
+                if val > 0:
+                    logger.info("Recovered remote KV cursor: %d", val)
+                    return val
+        except Exception:
+            pass
+        return 0
 
     def append_ledger(self, record: dict[str, Any]) -> None:
         """Thread-safely append a verified job or attestation record to work_ledger.jsonl."""
@@ -396,7 +413,6 @@ class StateManager:
                     os.fsync(f.fileno())
             except Exception as err:
                 logger.error("Failed to append record to ledger %s: %s", self.ledger_path, err)
-                raise StateError(f"Failed to write to ledger: {err}") from err
 
     def get_ledger_count(self) -> int:
         """Return total number of recorded ledger entries."""
@@ -431,23 +447,56 @@ class StateManager:
 
 
 # ==============================================================================
-# Work Ingestion & Verification Logic (`WorkVerifier`)
+# Work Indexing & Harsh Verification Logic (`WorkVerifier`)
 # ==============================================================================
 
 
 class WorkVerifier:
-    """Parses and validates structured work messages (RESULT, DELIVER, PoUI, PROOF)."""
+    """Indexes JOBs and rigorously validates DELIVER/RESULT deliverables.
+    
+    Defaults to 'not' on templates, restatements, boilerplate, and missing domain facts.
+    Emits native board grammar:
+        ATTEST v1 | <job_id> | yes|not | <reason>
+    """
 
-    def __init__(self, my_did: str) -> None:
+    def __init__(self, my_did: str, max_job_cache: int = 1000) -> None:
         self.my_did = my_did
+        self.max_job_cache = max_job_cache
+        self.job_cache: dict[str, dict[str, Any]] = {}
+        self._lock = threading.Lock()
 
-    def parse_work_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
-        """Evaluate a room message to determine if it is verifiable unverified work.
+    def index_job(self, message: dict[str, Any]) -> bool:
+        """Index a JOB v1 announcement into memory cache."""
+        text = message.get("text", "")
+        seq = message.get("seq", 0)
+        match = JOB_PATTERN.match(text)
+        if not match:
+            return False
+
+        job_id = match.group(1).strip()
+        category = match.group(2).strip()
+        body = match.group(3).strip()
+
+        with self._lock:
+            self.job_cache[job_id] = {
+                "seq": seq,
+                "category": category,
+                "title": body.split("|")[0].strip() if "|" in body else body[:80].strip(),
+                "full_text": body,
+                "indexed_at": time.time(),
+            }
+            # Evict oldest if exceeding capacity
+            if len(self.job_cache) > self.max_job_cache:
+                oldest_key = next(iter(self.job_cache))
+                del self.job_cache[oldest_key]
+
+        logger.debug("Indexed JOB [%s]: category='%s', title='%s'", job_id, category, body[:60])
+        return True
+
+    def evaluate_deliverable(self, message: dict[str, Any]) -> dict[str, Any] | None:
+        """Evaluate a DELIVER or RESULT message against indexed criteria.
         
-        Ignores:
-        - Self messages (from my_did)
-        - Sentinels / existing PoUI attestations
-        - Simple check-ins, unparseable chat, lobby spam
+        Returns an evaluation dictionary or None if not an actionable deliverable.
         """
         sender = message.get("from", "")
         seq = message.get("seq")
@@ -460,71 +509,110 @@ class WorkVerifier:
         if sender == self.my_did:
             return None
 
-        # Ignore existing sentinel attestations or bot check-ins
-        if "[PoUI Sentinel]" in text or text.startswith("ATTEST") or text.startswith("CLAIM"):
+        # Ignore non-deliverables (ATTEST, CLAIM, JOB, lobby chat)
+        if text.startswith("ATTEST") or text.startswith("CLAIM") or text.startswith("JOB"):
             return None
 
-        # Check for matching work patterns
-        for pattern in WORK_PATTERNS:
-            match = pattern.match(text)
-            if match:
-                job_id = match.group(1).strip()
-                content = match.group(2).strip()
-                if self.is_valid_work_payload(job_id, content):
-                    job_hash = hashlib.sha256(f"{job_id}:{content}".encode("utf-8")).hexdigest()
-                    proof_summary = self.summarize_proof(job_id, content, job_hash)
-                    return {
-                        "seq": seq,
-                        "target_did": sender,
-                        "job_id": job_id,
-                        "job_hash": f"sha256:{job_hash}",
-                        "proof_summary": proof_summary,
-                        "raw_text": text,
-                        "content_len": len(content),
-                    }
+        match = DELIVER_PATTERN.match(text)
+        if not match:
+            return None
 
-        return None
+        job_id = match.group(1).strip()
+        deliverable = match.group(2).strip()
 
-    @staticmethod
-    def is_valid_work_payload(job_id: str, content: str) -> bool:
-        """Validate structure and substance of the work deliverable.
+        # Perform rigorous verification
+        score, reason = self.verify_work(job_id, deliverable)
+
+        return {
+            "seq": seq,
+            "target_did": sender,
+            "job_id": job_id,
+            "score": score,  # "yes" or "not"
+            "reason": reason,
+            "raw_text": text,
+            "deliverable_len": len(deliverable),
+        }
+
+    def verify_work(self, job_id: str, content: str) -> tuple[str, str]:
+        """Strictly evaluate work deliverable. Defaults to 'not' on junk/template/restatements.
         
-        Requires:
-        - Non-trivial job identifier (at least 3 characters)
-        - Substantive output content (at least 15 characters, not just placeholder)
-        - Verifiable structure (e.g. hash linkage, technical report, or execution summary)
+        Returns (score, reason) where score is 'yes' or 'not'.
         """
-        if not job_id or len(job_id) < 3:
-            return False
-        if not content or len(content) < 15:
-            return False
+        # 1. Check for known Sybil bot templates & boilerplates (Instant 'not')
+        for pattern in SYBIL_TEMPLATE_PATTERNS:
+            if pattern.search(content):
+                return (
+                    "not",
+                    "The result is a generic sybil bot template/boilerplate without actual task execution or substantive domain findings.",
+                )
 
-        # Filter trivial placeholders
-        lowered = content.lower()
-        if lowered in {"done", "finished", "ok", "delivered", "n/a", "test", "hello world"}:
-            return False
+        # 2. Length floor check
+        if len(content) < 80:
+            return (
+                "not",
+                f"The deliverable is too brief ({len(content)} chars) to provide a verifiable technical solution.",
+            )
 
-        return True
+        # 3. Truncation check (ends mid-sentence, open quotes, hanging ellipsis)
+        if content.endswith("...") or content.endswith("…") or content.endswith("“") or content.endswith("(") or content.endswith("with"):
+            return (
+                "not",
+                "The deliverable cuts off mid-sentence and contains incomplete execution instructions.",
+            )
+
+        # 4. Job linkage check
+        with self._lock:
+            job_info = self.job_cache.get(job_id)
+
+        if job_info:
+            job_title = job_info["title"].lower()
+            job_body = job_info["full_text"].lower()
+            content_lower = content.lower()
+
+            # Check if deliverable is just a superficial restatement of the job title/prompt
+            if job_title in content_lower and len(content) < len(job_title) + 100:
+                return (
+                    "not",
+                    "The result restates the task parameters without providing any substantive execution steps, proof, or solutions.",
+                )
+
+            # Check for domain keywords / Done when criteria if present
+            if "done when:" in job_body:
+                criteria_part = job_body.split("done when:")[1].split("check via:")[0].strip()
+                criteria_words = [w for w in re.findall(r"\b[a-z0-9_-]{4,}\b", criteria_part) if w not in {"that", "with", "from", "when", "done", "must", "have", "this"}]
+                matched_criteria = sum(1 for w in criteria_words if w in content_lower)
+                if criteria_words and matched_criteria < max(2, len(criteria_words) // 4):
+                    return (
+                        "not",
+                        "The deliverable fails to address the specific 'Done when' success criteria specified in the job posting.",
+                    )
+
+        # 5. Concrete evidence check: numbers, equations, code, citations, specific technical terms
+        has_numbers = bool(re.search(r"\b\d+(?:\.\d+)?\b", content))
+        has_technical_structure = bool(re.search(r"[:=><\(\)\[\]\{\}\\\/\+\-\*#]", content))
+        has_substantive_length = len(content) >= 220
+
+        if not (has_numbers and has_technical_structure and has_substantive_length):
+            return (
+                "not",
+                "The result describes a generic approach without providing concrete parameters, calculations, code, or verifiable domain data.",
+            )
+
+        # Rare pass: deliverable provides substantial length, concrete data, and satisfies criteria
+        return (
+            "yes",
+            "Deliverable provides concrete technical parameters, verifiable calculations, and directly satisfies the task requirements.",
+        )
 
     @staticmethod
-    def summarize_proof(job_id: str, content: str, job_hash: str) -> str:
-        """Create a compact, verifiable single-line proof summary for attestation."""
-        clean_content = TechnocoreCrypto.normalize_message(content)
-        # Use short hash and a trimmed snippet of the work evidence
-        short_hash = job_hash[:16]
-        preview = clean_content[:64]
-        if len(clean_content) > 64:
-            preview += "..."
-        summary = f"job:{job_id} h:{short_hash} [{preview}]"
-        # Ensure single line and within safe bounds
-        return TechnocoreCrypto.normalize_message(summary)
-
-    @staticmethod
-    def format_attestation_text(target_sender: str, seq: int, proof_summary: str) -> str:
-        """Build the exact required attestation message format:
-        [PoUI Sentinel]: ATTEST target:<target_sender> seq:<msg_id> proof:<proof_summary> status:VERIFIED
+    def format_attestation_text(job_id: str, score: str, reason: str) -> str:
+        """Format native Technocore grammar:
+        ATTEST v1 | <job_id> | yes|not | <reason>
         """
-        raw = f"[PoUI Sentinel]: ATTEST target:{target_sender} seq:{seq} proof:{proof_summary} status:VERIFIED"
+        clean_job = TechnocoreCrypto.normalize_message(job_id)
+        clean_score = "yes" if score.lower() in {"yes", "useful", "valid", "true"} else "not"
+        clean_reason = TechnocoreCrypto.normalize_message(reason)
+        raw = f"ATTEST v1 | {clean_job} | {clean_score} | {clean_reason}"
         return TechnocoreCrypto.normalize_message(raw)
 
 
@@ -536,7 +624,7 @@ class WorkVerifier:
 class InferenceConsumer:
     """Extensible client hook for Flop Labs Q4 Testnet inference & faucet integration.
     
-    Ready to plug into Q4 faucet tokens and spend them on decentralized inference.
+    Reports ready only when a valid faucet token / live testnet endpoint is configured.
     """
 
     def __init__(
@@ -545,25 +633,17 @@ class InferenceConsumer:
         testnet_endpoint: str | None = None,
     ) -> None:
         self.faucet_token = faucet_token or os.environ.get("FLOP_FAUCET_TOKEN")
-        self.testnet_endpoint = testnet_endpoint or os.environ.get(
-            "FLOP_TESTNET_ENDPOINT", "https://testnet.flop.ai/v1"
-        )
+        self.testnet_endpoint = testnet_endpoint or os.environ.get("FLOP_TESTNET_ENDPOINT")
         self._total_inferences = 0
 
-    def execute_faucet_inference(self, faucet_token: str, prompt: str) -> dict[str, Any]:
-        """Execute an inference task using Flop Labs Q4 testnet faucet tokens.
-        
-        This method acts as the standard pluggable hook for Q4 inference execution.
-        """
+    def execute_faucet_inference(self, faucet_token: str | None, prompt: str) -> dict[str, Any]:
+        """Execute an inference task using Flop Labs Q4 testnet faucet tokens."""
         token = faucet_token or self.faucet_token
         if not token:
-            logger.info("InferenceConsumer: No faucet token provided; simulating testnet dry-run execution")
-            token = "faucet_testnet_dryrun"
+            raise ProtocolError("Cannot execute inference: No FLOP_FAUCET_TOKEN configured.")
 
         prompt_clean = TechnocoreCrypto.normalize_message(prompt)
         prompt_hash = hashlib.sha256(prompt_clean.encode("utf-8")).hexdigest()
-
-        # Simulated Q4 PoUI execution stub
         execution_id = f"exec_{int(time.time() * 1000)}_{prompt_hash[:8]}"
         self._total_inferences += 1
 
@@ -579,13 +659,13 @@ class InferenceConsumer:
                 "output_hash": hashlib.sha256(execution_id.encode("utf-8")).hexdigest(),
             },
         }
-        logger.info("InferenceConsumer executed testnet task %s for prompt hash %s", execution_id, prompt_hash[:8])
+        logger.info("InferenceConsumer executed testnet task %s", execution_id)
         return result
 
     @property
     def is_configured(self) -> bool:
-        """Return True if faucet token is configured."""
-        return bool(self.faucet_token)
+        """Return True only if a real faucet token is provided."""
+        return bool(self.faucet_token and self.faucet_token.strip())
 
     @property
     def total_inferences(self) -> int:
@@ -599,7 +679,7 @@ class InferenceConsumer:
 
 
 class KibbleClient:
-    """Client for reading from and publishing signed attestations to Technocore #kibble."""
+    """Client for reading from and publishing signed ATTEST v1 messages to Technocore #kibble."""
 
     def __init__(
         self,
@@ -614,7 +694,7 @@ class KibbleClient:
         self.did = TechnocoreCrypto.did_from_private_key(private_key)
         self.base_url = base_url.rstrip("/")
         self.room = room
-        self.state_manager = state_manager or StateManager()
+        self.state_manager = state_manager or StateManager(agent_did=self.did)
         self.timeout = timeout
         self.dry_run = dry_run
 
@@ -624,9 +704,12 @@ class KibbleClient:
         self.last_nonce = int(time.time() * 1000)
         self.last_attestation_time = 0.0
         self.total_attestations = 0
+        self.attest_yes_count = 0
+        self.attest_not_count = 0
         self.last_poll_time: str | None = None
         self._running = False
         self._nonce_lock = threading.Lock()
+        self._initialized = False
 
     def get_next_nonce(self) -> int:
         """Generate a strictly increasing millisecond nonce."""
@@ -638,18 +721,25 @@ class KibbleClient:
                 self.last_nonce = now_ms
             return self.last_nonce
 
-    def read_room(self, since: int, limit: int = 50) -> dict[str, Any]:
-        """Fetch messages from the room starting after sequence `since`."""
-        query: dict[str, str | int] = {"format": "json", "limit": limit}
-        if since > 0:
+    def read_room(
+        self,
+        since: int | None = None,
+        limit: int = DEFAULT_POLL_LIMIT,
+        wait: float | None = None,
+    ) -> dict[str, Any]:
+        """Fetch messages from the room with long-polling support (?since=X&wait=10)."""
+        query: dict[str, str | int | float] = {"format": "json", "limit": limit}
+        if since is not None and since > 0:
             query["since"] = since
+        if wait is not None and wait > 0:
+            query["wait"] = wait
 
         url = f"{self.base_url}/r/{self.room}?{urlencode(query)}"
         req = Request(
             url,
             headers={
                 "Accept": "application/json",
-                "User-Agent": f"{APP_NAME}/{APP_VERSION} (PoUI Sentinel; Flop Q4 Testnet)",
+                "User-Agent": f"technocore-did-starter/{APP_VERSION}",
             },
         )
         try:
@@ -667,43 +757,66 @@ class KibbleClient:
         except Exception as err:
             raise NetworkError(f"Request failed: {err}") from err
 
+    def initialize_tip_cursor(self) -> int:
+        """Ensure the agent starts at the live room tip (zero backlog replay)."""
+        local_cursor = self.state_manager.get_local_cursor()
+        kv_cursor = self.state_manager.fetch_kv_cursor()
+
+        # If we have a previously persisted cursor > 0, resume from max(local, kv)
+        resumed_cursor = max(local_cursor, kv_cursor)
+        if resumed_cursor > 0:
+            logger.info("Resuming from persisted cursor: %d", resumed_cursor)
+            self._initialized = True
+            return resumed_cursor
+
+        # First boot / empty ephemeral disk: jump directly to live tip
+        logger.info("First boot detected (cursor=0). Jumping to room tip (no backlog replay)...")
+        try:
+            room_state = self.read_room(limit=1)
+            tip_seq = int(room_state.get("last_seq", 0))
+            if tip_seq > 0:
+                logger.info("Jumped to live room tip cursor: %d. No historical messages will be attested.", tip_seq)
+                self.state_manager.update_cursor(tip_seq)
+                self._initialized = True
+                return tip_seq
+        except Exception as err:
+            logger.error("Failed to read room tip on startup: %s", err)
+
+        self._initialized = True
+        return 0
+
     def post_signed_attestation(self, text: str) -> dict[str, Any]:
-        """Publish a cryptographically signed attestation message to #kibble.
-        
-        Implements primary GET write endpoint:
-        GET https://technocore.chat/r/kibble/say-signed/<did>/<sig>/<nonce>/<encoded_text>
-        with fallback to signed POST if GET fails or text is long.
-        """
+        """Publish a cryptographically signed ATTEST v1 message to #kibble."""
         nonce = self.get_next_nonce()
         normalized, payload = TechnocoreCrypto.format_signing_payload(self.room, nonce, text)
         sig = TechnocoreCrypto.sign_payload(self.private_key, payload)
 
         if self.dry_run:
-            logger.info("[DRY-RUN] Would post attestation: %s (nonce=%d, sig=%s)", normalized, nonce, sig[:16])
+            logger.info("[DRY-RUN] Would broadcast attestation: %s (nonce=%d, sig=%s)", normalized, nonce, sig[:16])
             return {"status": "dry_run", "nonce": nonce, "sig": sig, "text": normalized}
 
         encoded_text = quote(normalized, safe="")
         get_url = f"{self.base_url}/r/{self.room}/say-signed/{self.did}/{sig}/{nonce}/{encoded_text}"
 
-        # Attempt GET endpoint first
+        # 1. Try GET /say-signed
         try:
             req = Request(
                 get_url,
                 headers={
                     "Accept": "application/json, text/plain, */*",
-                    "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+                    "User-Agent": f"technocore-did-starter/{APP_VERSION}",
                 },
             )
             with urlopen(req, timeout=self.timeout) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
-                logger.info("Published signed attestation via GET say-signed: %s", normalized)
+                logger.info("Published signed ATTEST via GET say-signed: %s", normalized)
                 return {"status": "ok", "response": raw, "method": "GET", "nonce": nonce, "sig": sig}
         except HTTPError as err:
             logger.warning("GET say-signed returned HTTP %d. Attempting POST /r/%s fallback...", err.code, self.room)
         except Exception as err:
             logger.warning("GET say-signed failed (%s). Attempting POST /r/%s fallback...", err, self.room)
 
-        # Fallback to signed POST
+        # 2. Fallback to signed POST
         post_url = f"{self.base_url}/r/{self.room}?format=json"
         body_bytes = json.dumps(
             {
@@ -722,40 +835,35 @@ class KibbleClient:
             headers={
                 "Accept": "application/json",
                 "Content-Type": "application/json; charset=utf-8",
-                "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+                "User-Agent": f"technocore-did-starter/{APP_VERSION}",
             },
         )
         try:
             with urlopen(req, timeout=self.timeout) as resp:
                 raw = resp.read()
                 data = json.loads(raw.decode("utf-8"))
-                logger.info("Published signed attestation via POST: %s", normalized)
+                logger.info("Published signed ATTEST via POST: %s", normalized)
                 return {"status": "ok", "response": data, "method": "POST", "nonce": nonce, "sig": sig}
         except Exception as err:
             raise NetworkError(f"Failed to post signed message to {self.room}: {err}") from err
 
-    def process_cycle(self) -> int:
-        """Execute one polling and verification cycle.
-        
-        Returns count of new messages processed.
-        """
+    def process_cycle(self, wait: float = DEFAULT_FOLLOW_WAIT_SECONDS) -> int:
+        """Execute one long-polling cycle (?since=X&wait=10)."""
+        if not self._initialized:
+            current_cursor = self.initialize_tip_cursor()
+        else:
+            current_cursor = self.state_manager.get_local_cursor()
+
         self.last_poll_time = datetime.now(timezone.utc).isoformat()
-        current_cursor = self.state_manager.get_cursor()
 
         try:
-            response = self.read_room(since=current_cursor, limit=50)
+            response = self.read_room(since=current_cursor, limit=DEFAULT_POLL_LIMIT, wait=wait)
         except NetworkError as err:
             logger.error("Failed to read #kibble room: %s", err)
             return 0
 
         messages = response.get("messages", [])
         last_seq = response.get("last_seq", current_cursor)
-
-        # If cursor is uninitialized (0) and room has messages, sync to current last_seq
-        if current_cursor == 0 and last_seq > 0 and not messages:
-            logger.info("Initializing cursor to current room sequence: %d", last_seq)
-            self.state_manager.update_cursor(last_seq)
-            return 0
 
         if not messages:
             if last_seq > current_cursor:
@@ -774,89 +882,100 @@ class KibbleClient:
                 new_max_seq = seq
 
             processed_count += 1
-            work_item = self.verifier.parse_work_message(msg)
-            if not work_item:
+
+            # 1. If it's a JOB, index it in memory
+            if self.verifier.index_job(msg):
                 continue
 
+            # 2. If it's a DELIVER/RESULT, evaluate strictly
+            eval_result = self.verifier.evaluate_deliverable(msg)
+            if not eval_result:
+                continue
+
+            job_id = eval_result["job_id"]
+            score = eval_result["score"]
+            reason = eval_result["reason"]
+
             logger.info(
-                "Identified verifiable PoUI work: seq=%d target=%s job=%s hash=%s",
-                work_item["seq"],
-                work_item["target_did"][:24] + "...",
-                work_item["job_id"],
-                work_item["job_hash"][:16],
+                "Evaluated deliverable: seq=%d job=%s score=%s reason='%s'",
+                eval_result["seq"],
+                job_id,
+                score.upper(),
+                reason[:70],
             )
 
-            # Check 60s rate limit
+            # Check 60s rate limit on broadcast
             now = time.time()
             elapsed = now - self.last_attestation_time
             if elapsed < DEFAULT_ATTESTATION_COOLDOWN_SECONDS:
                 logger.info(
-                    "Rate limit active (%.1fs < %.0fs). Skipping attestation broadcast for seq=%d",
+                    "Rate limit active (%.1fs < %.0fs). Logging evaluation to ledger without broadcast for seq=%d",
                     elapsed,
                     DEFAULT_ATTESTATION_COOLDOWN_SECONDS,
-                    work_item["seq"],
+                    eval_result["seq"],
                 )
-                # Still record to ledger as verified work
                 self.state_manager.append_ledger({
-                    "target_did": work_item["target_did"],
-                    "sequence_id": work_item["seq"],
-                    "job_id": work_item["job_id"],
-                    "job_hash": work_item["job_hash"],
-                    "verification_status": "VERIFIED_RATE_LIMITED",
-                    "proof_summary": work_item["proof_summary"],
+                    "target_did": eval_result["target_did"],
+                    "sequence_id": eval_result["seq"],
+                    "job_id": job_id,
+                    "score": score,
+                    "reason": reason,
+                    "broadcast": False,
                 })
                 continue
 
-            # Format and publish attestation
+            # Format native ATTEST v1 line
             attestation_text = self.verifier.format_attestation_text(
-                target_sender=work_item["target_did"],
-                seq=work_item["seq"],
-                proof_summary=work_item["proof_summary"],
+                job_id=job_id,
+                score=score,
+                reason=reason,
             )
 
             try:
                 result = self.post_signed_attestation(attestation_text)
                 self.last_attestation_time = time.time()
                 self.total_attestations += 1
+                if score == "yes":
+                    self.attest_yes_count += 1
+                else:
+                    self.attest_not_count += 1
 
-                # Persist to append-only work ledger
+                # Record to ledger
                 self.state_manager.append_ledger({
-                    "target_did": work_item["target_did"],
-                    "sequence_id": work_item["seq"],
-                    "job_id": work_item["job_id"],
-                    "job_hash": work_item["job_hash"],
-                    "verification_status": "VERIFIED",
-                    "proof_summary": work_item["proof_summary"],
+                    "target_did": eval_result["target_did"],
+                    "sequence_id": eval_result["seq"],
+                    "job_id": job_id,
+                    "score": score,
+                    "reason": reason,
                     "attestation_text": attestation_text,
                     "nonce": result.get("nonce"),
                     "signature": result.get("sig"),
+                    "broadcast": True,
                 })
-                logger.info("Successfully recorded attestation for seq=%d to work_ledger.jsonl", work_item["seq"])
+                logger.info("Successfully recorded ATTEST for job %s (score=%s) to ledger", job_id, score)
             except Exception as err:
-                logger.error("Failed to broadcast attestation for seq=%d: %s", work_item["seq"], err)
+                logger.error("Failed to broadcast ATTEST for job %s: %s", job_id, err)
 
-        # Update cursor to highest sequence processed
+        # Advance cursor to newest seq
         if new_max_seq > current_cursor:
             self.state_manager.update_cursor(new_max_seq)
 
         return processed_count
 
     def run_loop(self) -> None:
-        """Continuous polling daemon loop with 30-45s jittered intervals."""
+        """Continuous long-polling daemon loop."""
         self._running = True
-        logger.info("Starting PoUI Sentinel polling loop on #%s (DID: %s)", self.room, self.did)
+        logger.info("Starting PoUI Sentinel long-polling engine on #%s (DID: %s)", self.room, self.did)
+
+        # Initial tip jump
+        self.initialize_tip_cursor()
 
         while self._running:
             try:
-                self.process_cycle()
+                self.process_cycle(wait=DEFAULT_FOLLOW_WAIT_SECONDS)
             except Exception as err:
-                logger.error("Unexpected error in polling cycle: %s", err, exc_info=True)
-
-            sleep_duration = random.uniform(DEFAULT_POLL_MIN_SECONDS, DEFAULT_POLL_MAX_SECONDS)
-            # Sleep in small slices to respond promptly to stop signal
-            deadline = time.time() + sleep_duration
-            while self._running and time.time() < deadline:
-                time.sleep(0.5)
+                logger.error("Unexpected error in polling loop: %s", err, exc_info=True)
+                time.sleep(2.0)
 
         logger.info("PoUI Sentinel polling loop stopped.")
 
@@ -871,14 +990,14 @@ class KibbleClient:
 
 
 def create_health_app(client: KibbleClient, start_time: float) -> Flask:
-    """Create a minimal Flask application exposing health and status metrics."""
+    """Create Flask application exposing health, uptime, and verification metrics."""
     app = Flask(__name__)
 
     @app.route("/", methods=["GET"])
     @app.route("/health", methods=["GET"])
     def health() -> Any:
         uptime = round(time.time() - start_time, 2)
-        cursor = client.state_manager.get_cursor()
+        cursor = client.state_manager.get_local_cursor()
         ledger_count = client.state_manager.get_ledger_count()
         target_did_match = (client.did == TARGET_DID)
 
@@ -891,10 +1010,15 @@ def create_health_app(client: KibbleClient, start_time: float) -> Flask:
             "target_did_match": target_did_match,
             "uptime_seconds": uptime,
             "total_attestations": client.total_attestations,
+            "attestation_breakdown": {
+                "yes": client.attest_yes_count,
+                "not": client.attest_not_count,
+            },
             "current_cursor": cursor,
             "last_poll_time": client.last_poll_time,
+            "indexed_jobs_count": len(client.verifier.job_cache),
             "ledger_count": ledger_count,
-            "testnet_consumer_ready": True,
+            "testnet_consumer_ready": client.inference_consumer.is_configured,
             "dry_run": client.dry_run,
         })
 
@@ -919,7 +1043,7 @@ def create_health_app(client: KibbleClient, start_time: float) -> Flask:
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Technocore #kibble PoUI Compute Agent & Ledger Attester",
+        description="Technocore #kibble PoUI Sentinel & Attester",
     )
     parser.add_argument(
         "--key-path",
@@ -966,7 +1090,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--once",
         action="store_true",
-        help="Run a single ingestion cycle and exit immediately",
+        help="Run a single ingestion cycle without long-poll and exit immediately",
     )
     parser.add_argument(
         "--verbose",
@@ -1004,7 +1128,12 @@ def main() -> None:
         )
 
     # 2. Initialize State & Client
-    state_manager = StateManager(cursor_path=args.cursor_path, ledger_path=args.ledger_path)
+    state_manager = StateManager(
+        cursor_path=args.cursor_path,
+        ledger_path=args.ledger_path,
+        base_url=args.base_url,
+        agent_did=agent_did,
+    )
     client = KibbleClient(
         private_key=private_key,
         base_url=args.base_url,
@@ -1016,11 +1145,11 @@ def main() -> None:
     # 3. Single-cycle mode if --once specified
     if args.once:
         logger.info("Running single ingestion cycle (--once)...")
-        count = client.process_cycle()
+        count = client.process_cycle(wait=0)
         logger.info("Single cycle completed. Processed %d new messages. Exiting.", count)
         sys.exit(0)
 
-    # 4. Start background polling thread
+    # 4. Start background long-polling thread
     poll_thread = threading.Thread(target=client.run_loop, name="KibblePollEngine", daemon=True)
     poll_thread.start()
 

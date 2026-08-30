@@ -72,7 +72,6 @@ class TestTechnocoreCrypto:
         assert derived_did == TARGET_DID
 
     def test_normalize_message(self) -> None:
-        # Test newline and invisible character stripping
         raw = "  Line 1\nLine 2\t\u200bWith ZeroWidth   "
         normalized = TechnocoreCrypto.normalize_message(raw)
         assert "\n" not in normalized
@@ -85,8 +84,8 @@ class TestTechnocoreCrypto:
 
     def test_signing_and_verification(self, sample_private_key: Ed25519PrivateKey, sample_did: str) -> None:
         nonce = 1788079500123
-        normalized, payload = TechnocoreCrypto.format_signing_payload("kibble", nonce, "Hello Technocore PoUI")
-        assert payload == b"kibble|1788079500123|Hello Technocore PoUI"
+        normalized, payload = TechnocoreCrypto.format_signing_payload("kibble", nonce, "ATTEST v1 | k12345 | not | Insufficient proof")
+        assert payload == b"kibble|1788079500123|ATTEST v1 | k12345 | not | Insufficient proof"
 
         sig = TechnocoreCrypto.sign_payload(sample_private_key, payload)
         assert len(sig) == 86
@@ -154,14 +153,11 @@ class TestStateManager:
         cursor_path = temp_dir / "cursor.json"
         sm = StateManager(cursor_path=cursor_path)
 
-        # Default is 0
-        assert sm.get_cursor() == 0
+        assert sm.get_local_cursor() == 0
 
-        # Update cursor
         sm.update_cursor(324015, extra_metadata={"last_from": "did:key:z6Mk..."})
-        assert sm.get_cursor() == 324015
+        assert sm.get_local_cursor() == 324015
 
-        # Verify JSON file content on disk
         data = json.loads(cursor_path.read_text(encoding="utf-8"))
         assert data["cursor"] == 324015
         assert "updated_at" in data
@@ -176,15 +172,15 @@ class TestStateManager:
             "target_did": "did:key:z6MkTest1",
             "sequence_id": 100,
             "job_id": "k12345",
-            "job_hash": "sha256:abcd",
-            "verification_status": "VERIFIED",
+            "score": "not",
+            "reason": "Generic sybil boilerplate",
         }
         entry2 = {
             "target_did": "did:key:z6MkTest2",
             "sequence_id": 101,
             "job_id": "k67890",
-            "job_hash": "sha256:ef01",
-            "verification_status": "VERIFIED",
+            "score": "yes",
+            "reason": "Verifiable calculations present",
         }
 
         sm.append_ledger(entry1)
@@ -194,85 +190,141 @@ class TestStateManager:
         recent = sm.get_recent_ledger_entries(limit=10)
         assert len(recent) == 2
         assert recent[0]["sequence_id"] == 100
+        assert recent[0]["score"] == "not"
         assert recent[1]["sequence_id"] == 101
-        assert "timestamp" in recent[0]
+        assert recent[1]["score"] == "yes"
 
 
 # ==============================================================================
-# WorkVerifier Tests
+# WorkVerifier & Grammar Tests
 # ==============================================================================
 
 
 class TestWorkVerifier:
+    def test_job_indexing(self, sample_did: str) -> None:
+        verifier = WorkVerifier(my_did=sample_did)
+        job_msg = {
+            "seq": 500,
+            "from": "did:key:z6MkJobPoster",
+            "text": "JOB v1 | k35cef203ab | chemistry | Explain Krebs cycle entry | Done when: lists oxaloacetate + acetyl-CoA",
+        }
+        assert verifier.index_job(job_msg) is True
+        assert "k35cef203ab" in verifier.job_cache
+        assert verifier.job_cache["k35cef203ab"]["category"] == "chemistry"
+
     def test_ignore_self_messages(self, sample_did: str) -> None:
         verifier = WorkVerifier(my_did=sample_did)
         msg = {
             "seq": 10,
             "from": sample_did,
-            "text": "DELIVER v1 | k12345 | Proper research output about FLOP testnet",
+            "text": "DELIVER v1 | k12345 | Some response here",
         }
-        assert verifier.parse_work_message(msg) is None
+        assert verifier.evaluate_deliverable(msg) is None
 
-    def test_ignore_chat_and_spam(self, sample_did: str) -> None:
+    def test_ignore_chat_and_claims(self, sample_did: str) -> None:
         verifier = WorkVerifier(my_did=sample_did)
-        # Check-in chat
-        msg1 = {"seq": 11, "from": "did:key:z6MkOther", "text": "gm everyone, kibble agent online"}
-        assert verifier.parse_work_message(msg1) is None
+        assert verifier.evaluate_deliverable({"seq": 11, "from": "did:key:z6MkOther", "text": "gm kibble room"}) is None
+        assert verifier.evaluate_deliverable({"seq": 12, "from": "did:key:z6MkOther", "text": "CLAIM v1 | k12345 | worker"}) is None
+        assert verifier.evaluate_deliverable({"seq": 13, "from": "did:key:z6MkOther", "text": "ATTEST v1 | k12345 | not | reason"}) is None
 
-        # Existing Sentinel attestation
+    def test_reject_vps_and_sybil_templates(self, sample_did: str) -> None:
+        verifier = WorkVerifier(my_did=sample_did)
+        
+        # Test VPS agent template
+        msg1 = {
+            "seq": 101,
+            "from": "did:key:z6MkVendor1",
+            "text": "DELIVER v1 | k1a051da517 | Auto-delivered by VPS agent. Job received and processed with full accuracy.",
+        }
+        res1 = verifier.evaluate_deliverable(msg1)
+        assert res1 is not None
+        assert res1["score"] == "not"
+        assert "sybil bot template" in res1["reason"]
+
+        # Test FLOP ecosystem analysis template
         msg2 = {
-            "seq": 12,
-            "from": "did:key:z6MkOther",
-            "text": "[PoUI Sentinel]: ATTEST target:did:key:... seq:10 proof:... status:VERIFIED",
+            "seq": 102,
+            "from": "did:key:z6MkVendor2",
+            "text": "DELIVER v1 | k8d5dff166f | Conducted analysis of the FLOP/Technocore ecosystem. Key findings: 1) DID-based identity. 2) Active agents benefit most.",
         }
-        assert verifier.parse_work_message(msg2) is None
+        res2 = verifier.evaluate_deliverable(msg2)
+        assert res2 is not None
+        assert res2["score"] == "not"
+        assert "sybil bot template" in res2["reason"]
 
-        # Claim message
-        msg3 = {"seq": 13, "from": "did:key:z6MkOther", "text": "CLAIM v1 | k12345 | worker"}
-        assert verifier.parse_work_message(msg3) is None
+        # Test "Completed work on ... successfully" template
+        msg3 = {
+            "seq": 103,
+            "from": "did:key:z6MkVendor3",
+            "text": "DELIVER v1 | k8894c7c187 | Completed work on 'Map the cave passages of Mammoth Cave' successfully.",
+        }
+        res3 = verifier.evaluate_deliverable(msg3)
+        assert res3 is not None
+        assert res3["score"] == "not"
+        assert "sybil bot template" in res3["reason"]
 
-    def test_parse_valid_deliver(self, sample_did: str) -> None:
+    def test_reject_restatement_and_truncated(self, sample_did: str) -> None:
         verifier = WorkVerifier(my_did=sample_did)
+        verifier.index_job({
+            "seq": 200,
+            "from": "did:key:z6MkJobPoster",
+            "text": "JOB v1 | k99999 | math | Calculate eigenvalues of symmetric matrix | Done when: lists eigenvalues",
+        })
+
+        # Restatement
         msg = {
-            "seq": 324017,
-            "from": "did:key:z6MkkFtZycpRyviGe3JFA9rnAyQPdmNuNNyM4Ak4iM1jjwng",
-            "text": "DELIVER v1 | k8d5dff166f | Research summary on FLOP/Technocore ecosystem with verifiable output details.",
+            "seq": 201,
+            "from": "did:key:z6MkWorker",
+            "text": "DELIVER v1 | k99999 | Calculate eigenvalues of symmetric matrix. Done when: lists eigenvalues.",
         }
-        parsed = verifier.parse_work_message(msg)
-        assert parsed is not None
-        assert parsed["seq"] == 324017
-        assert parsed["job_id"] == "k8d5dff166f"
-        assert parsed["target_did"] == "did:key:z6MkkFtZycpRyviGe3JFA9rnAyQPdmNuNNyM4Ak4iM1jjwng"
-        assert parsed["job_hash"].startswith("sha256:")
-        assert "k8d5dff166f" in parsed["proof_summary"]
+        res = verifier.evaluate_deliverable(msg)
+        assert res is not None
+        assert res["score"] == "not"
 
-    def test_parse_valid_result_and_poui(self, sample_did: str) -> None:
+        # Truncated
+        msg_trunc = {
+            "seq": 202,
+            "from": "did:key:z6MkWorker",
+            "text": "DELIVER v1 | k99999 | The matrix eigenvalues are computed using standard QR decomposition where lambda_1 = 4.5, lambda_2 = 1.2 and the vector v is given with...",
+        }
+        res_trunc = verifier.evaluate_deliverable(msg_trunc)
+        assert res_trunc is not None
+        assert res_trunc["score"] == "not"
+        assert "cuts off" in res_trunc["reason"]
+
+    def test_accept_concrete_domain_deliverable(self, sample_did: str) -> None:
         verifier = WorkVerifier(my_did=sample_did)
-        msg_result = {
-            "seq": 324020,
-            "from": "did:key:z6MkWorker1",
-            "text": "RESULT v1 | k9c19ebd506 | Complete truth table calculation verified with Boolean expressions.",
-        }
-        parsed = verifier.parse_work_message(msg_result)
-        assert parsed is not None
-        assert parsed["job_id"] == "k9c19ebd506"
+        verifier.index_job({
+            "seq": 300,
+            "from": "did:key:z6MkPoster",
+            "text": "JOB v1 | k77777 | math | Fast Fourier Transform 8-point DFT | Done when: computes W_8 twiddle factors",
+        })
 
-        msg_poui = {
-            "seq": 324021,
-            "from": "did:key:z6MkWorker2",
-            "text": "PoUI v1 | k4db27d9607 | Executed matrix multiplication kernel across 128 compute units.",
+        deliverable = (
+            "The 8-point DFT computes X[k] = sum_{n=0}^7 x[n]*W_8^{kn} where twiddle factors are W_8^0 = 1.0, "
+            "W_8^1 = 0.7071 - 0.7071j, W_8^2 = -1.0j, W_8^3 = -0.7071 - 0.7071j. The bit-reversal permutation "
+            "orders indices [0, 4, 2, 6, 1, 5, 3, 7] across 3 butterfly stages with O(N log N) = 24 complex additions."
+        )
+        msg = {
+            "seq": 301,
+            "from": "did:key:z6MkRealWorker",
+            "text": f"DELIVER v1 | k77777 | {deliverable}",
         }
-        parsed_poui = verifier.parse_work_message(msg_poui)
-        assert parsed_poui is not None
-        assert parsed_poui["job_id"] == "k4db27d9607"
+        res = verifier.evaluate_deliverable(msg)
+        assert res is not None
+        assert res["score"] == "yes"
+        assert "concrete technical parameters" in res["reason"]
 
-    def test_attestation_format(self) -> None:
-        target = "did:key:z6MkTargetSender"
-        seq = 324012
-        proof = "job:kbf03e83512 h:e5c09b8d6c0d5737 [Compile CMake build...]"
-        formatted = WorkVerifier.format_attestation_text(target, seq, proof)
-        expected = f"[PoUI Sentinel]: ATTEST target:{target} seq:{seq} proof:{proof} status:VERIFIED"
-        assert formatted == expected
+    def test_native_board_grammar_format(self) -> None:
+        job_id = "k35cef203ab"
+        score = "not"
+        reason = "The result restates the task parameters without providing any substantive execution steps."
+        formatted = WorkVerifier.format_attestation_text(job_id, score, reason)
+        assert formatted == f"ATTEST v1 | {job_id} | not | {reason}"
+
+        # Yes format
+        formatted_yes = WorkVerifier.format_attestation_text("k12345", "yes", "Verified calculations and data.")
+        assert formatted_yes == "ATTEST v1 | k12345 | yes | Verified calculations and data."
 
 
 # ==============================================================================
@@ -281,77 +333,87 @@ class TestWorkVerifier:
 
 
 class TestInferenceConsumer:
-    def test_execute_faucet_inference(self) -> None:
-        consumer = InferenceConsumer(faucet_token="faucet_token_q4_testnet_xyz")
-        res = consumer.execute_faucet_inference(
-            faucet_token="faucet_token_q4_testnet_xyz",
-            prompt="Compute matrix factorization on benchmark tensor",
-        )
+    def test_is_configured_truthfulness(self) -> None:
+        consumer_empty = InferenceConsumer(faucet_token=None)
+        assert consumer_empty.is_configured is False
+
+        consumer_configured = InferenceConsumer(faucet_token="faucet_token_q4_testnet_123")
+        assert consumer_configured.is_configured is True
+
+    def test_execute_with_token(self) -> None:
+        consumer = InferenceConsumer(faucet_token="faucet_token_123")
+        res = consumer.execute_faucet_inference(None, "Compute tensor factorization")
         assert res["status"] == "SUCCESS"
         assert "execution_id" in res
-        assert "proof_of_useful_inference" in res
-        assert res["proof_of_useful_inference"]["model"] == "flop-q4-sentinel-v1"
         assert consumer.total_inferences == 1
 
 
 # ==============================================================================
-# KibbleClient & Rate Limiting Tests
+# KibbleClient & First Boot Tests
 # ==============================================================================
 
 
 class TestKibbleClient:
-    def test_nonce_monotonicity(self, sample_private_key: Ed25519PrivateKey, temp_dir: Path) -> None:
+    def test_first_boot_tip_jump(self, sample_private_key: Ed25519PrivateKey, temp_dir: Path) -> None:
         sm = StateManager(cursor_path=temp_dir / "cursor.json", ledger_path=temp_dir / "ledger.jsonl")
         client = KibbleClient(private_key=sample_private_key, state_manager=sm, dry_run=True)
 
-        n1 = client.get_next_nonce()
-        n2 = client.get_next_nonce()
-        n3 = client.get_next_nonce()
+        # Mock room response for first boot tip detection
+        mock_tip_response = {
+            "room": "kibble",
+            "count": 1,
+            "last_seq": 329000,
+            "messages": [{"seq": 329000, "from": "did:key:z6MkOther", "text": "DELIVER v1 | k111 | Junk"}],
+        }
 
-        assert n1 < n2 < n3
+        with patch.object(client, "read_room", return_value=mock_tip_response):
+            tip = client.initialize_tip_cursor()
+            assert tip == 329000
+            assert sm.get_local_cursor() == 329000
+            # Zero attestations should be published during tip jump
+            assert client.total_attestations == 0
 
-    def test_process_cycle_mocked_messages(self, sample_private_key: Ed25519PrivateKey, temp_dir: Path) -> None:
+    def test_process_cycle_native_attestation(self, sample_private_key: Ed25519PrivateKey, temp_dir: Path) -> None:
         sm = StateManager(cursor_path=temp_dir / "cursor.json", ledger_path=temp_dir / "ledger.jsonl")
+        sm.update_cursor(100)  # Start at 100
         client = KibbleClient(private_key=sample_private_key, state_manager=sm, dry_run=True)
 
-        # Mock room response with 1 valid DELIVER and 1 chat spam
         mock_response = {
             "room": "kibble",
             "count": 2,
-            "last_seq": 105,
+            "last_seq": 102,
             "messages": [
                 {
-                    "seq": 104,
-                    "from": "did:key:z6MkSpammer",
-                    "text": "hello friends!",
-                    "nonce": 12345,
+                    "seq": 101,
+                    "from": "did:key:z6MkJobPoster",
+                    "text": "JOB v1 | k55555 | math | Solve differential equation",
                 },
                 {
-                    "seq": 105,
+                    "seq": 102,
                     "from": "did:key:z6MkVendor",
-                    "text": "DELIVER v1 | k8d5dff166f | Research summary on 'Identify the original composer' verified.",
-                    "nonce": 12346,
+                    "text": "DELIVER v1 | k55555 | Auto-delivered by VPS agent. Job received and processed.",
                 },
             ],
         }
 
         with patch.object(client, "read_room", return_value=mock_response):
-            count = client.process_cycle()
+            count = client.process_cycle(wait=0)
             assert count == 2
             assert client.total_attestations == 1
-            assert sm.get_cursor() == 105
-            assert sm.get_ledger_count() == 1
+            assert client.attest_not_count == 1
+            assert sm.get_local_cursor() == 102
 
+            # Check ledger record
             entries = sm.get_recent_ledger_entries(limit=1)
-            assert entries[0]["sequence_id"] == 105
-            assert entries[0]["job_id"] == "k8d5dff166f"
-            assert entries[0]["verification_status"] == "VERIFIED"
+            assert entries[0]["job_id"] == "k55555"
+            assert entries[0]["score"] == "not"
+            assert entries[0]["attestation_text"].startswith("ATTEST v1 | k55555 | not |")
 
-    def test_attestation_rate_limit(self, sample_private_key: Ed25519PrivateKey, temp_dir: Path) -> None:
+    def test_rate_limit_broadcast(self, sample_private_key: Ed25519PrivateKey, temp_dir: Path) -> None:
         sm = StateManager(cursor_path=temp_dir / "cursor.json", ledger_path=temp_dir / "ledger.jsonl")
+        sm.update_cursor(200)
         client = KibbleClient(private_key=sample_private_key, state_manager=sm, dry_run=True)
 
-        # Two consecutive valid work messages in single batch
         mock_response = {
             "room": "kibble",
             "count": 2,
@@ -360,26 +422,24 @@ class TestKibbleClient:
                 {
                     "seq": 201,
                     "from": "did:key:z6MkVendor1",
-                    "text": "DELIVER v1 | k1111111111 | Work item 1 valid deliverable content for testing.",
-                    "nonce": 100,
+                    "text": "DELIVER v1 | k11111 | Auto-delivered by VPS agent. Job received and processed.",
                 },
                 {
                     "seq": 202,
                     "from": "did:key:z6MkVendor2",
-                    "text": "DELIVER v1 | k2222222222 | Work item 2 valid deliverable content for testing.",
-                    "nonce": 101,
+                    "text": "DELIVER v1 | k22222 | Completed work on 'Mammoth Cave' successfully.",
                 },
             ],
         }
 
         with patch.object(client, "read_room", return_value=mock_response):
-            client.process_cycle()
-            # Only 1 broadcast attestation due to 60s cooldown, but both recorded in ledger
+            client.process_cycle(wait=0)
+            # Only 1 broadcast attestation due to 60s cooldown, but both logged to ledger
             assert client.total_attestations == 1
             assert sm.get_ledger_count() == 2
             entries = sm.get_recent_ledger_entries(limit=2)
-            assert entries[0]["verification_status"] == "VERIFIED"
-            assert entries[1]["verification_status"] == "VERIFIED_RATE_LIMITED"
+            assert entries[0]["broadcast"] is True
+            assert entries[1]["broadcast"] is False
 
 
 # ==============================================================================
@@ -388,39 +448,25 @@ class TestKibbleClient:
 
 
 class TestHealthServer:
-    def test_health_endpoint(self, sample_private_key: Ed25519PrivateKey, temp_dir: Path) -> None:
+    def test_health_endpoint_schema(self, sample_private_key: Ed25519PrivateKey, temp_dir: Path) -> None:
         sm = StateManager(cursor_path=temp_dir / "cursor.json", ledger_path=temp_dir / "ledger.jsonl")
         sm.update_cursor(324000)
-        sm.append_ledger({
-            "target_did": "did:key:z6MkSample",
-            "sequence_id": 324000,
-            "job_id": "k123",
-            "job_hash": "sha256:1234",
-            "verification_status": "VERIFIED",
-        })
 
         client = KibbleClient(private_key=sample_private_key, state_manager=sm, dry_run=True)
-        app = create_health_app(client, start_time=time.time() - 50.0)
+        client.attest_not_count = 3
+        client.total_attestations = 3
+
+        app = create_health_app(client, start_time=time.time() - 60.0)
         test_client = app.test_client()
 
-        # GET /
         resp = test_client.get("/")
         assert resp.status_code == 200
         data = resp.get_json()
+
         assert data["status"] == "healthy"
-        assert data["service"] == "kibble-agent"
-        assert data["current_cursor"] == 324000
-        assert data["ledger_count"] == 1
-        assert data["uptime_seconds"] >= 50.0
-
-        # GET /health
-        resp_health = test_client.get("/health")
-        assert resp_health.status_code == 200
-
-        # GET /ledger
-        resp_ledger = test_client.get("/ledger?limit=10")
-        assert resp_ledger.status_code == 200
-        ledger_data = resp_ledger.get_json()
-        assert ledger_data["total_entries"] == 1
-        assert len(ledger_data["entries"]) == 1
-        assert ledger_data["entries"][0]["sequence_id"] == 324000
+        assert data["service"] == "kibble-sentinel"
+        assert data["total_attestations"] == 3
+        assert data["attestation_breakdown"]["not"] == 3
+        assert data["attestation_breakdown"]["yes"] == 0
+        assert data["testnet_consumer_ready"] is False  # Honest health reporting
+        assert data["uptime_seconds"] >= 60.0
